@@ -102,6 +102,10 @@ fn registry_of(workers: &[(&MockWorker, WorkerMode)]) -> WorkerRegistry {
 /// A cache-aware router over `workers` whose KV prefixes come from the local `tree`.
 #[allow(dead_code)] // Only some test files route by a local radix tree.
 pub fn radix_router(workers: &[(&MockWorker, WorkerMode)], tree: HashTree) -> axum::Router {
+    build_router(Arc::new(radix_context(workers, tree)))
+}
+
+pub fn radix_context(workers: &[(&MockWorker, WorkerMode)], tree: HashTree) -> AppContext {
     let cfg = radix_config();
     let (tree, oracle) = (Arc::new(tree), BlockSizeOracle::new());
     oracle.try_set(1).unwrap();
@@ -115,7 +119,7 @@ pub fn radix_router(workers: &[(&MockWorker, WorkerMode)], tree: HashTree) -> ax
     );
     ctx.radix_tree_prefix_provider = Some(RadixTreePrefixProvider::new(tree, Arc::clone(&oracle)));
     ctx.block_size_oracle = oracle;
-    build_router(Arc::new(ctx))
+    ctx
 }
 
 /// [`radix_router`] on the bucket-first (reorg) selection path, over `state`'s tree.
