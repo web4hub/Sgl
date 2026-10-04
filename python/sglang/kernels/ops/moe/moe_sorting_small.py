@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import functools
 import logging
+import math
 from contextvars import ContextVar
 
 import torch
@@ -336,10 +337,12 @@ def _run_small_sort(
     else:
         n_cols, scalen_pad = 32, 8
         qout = qscale = moe_buf  # unused placeholder pointers
+    # largest power-of-two chunk (up to 2048 columns) that divides the row
+    qchunk = math.gcd(n_cols, 2048)
     num_buf = triton.cdiv(max(moe_buf.numel(), 1), buf_block)
     if p <= 64 and p <= 2 * block_size:
         # compact variant: one sort CTA does the P x P rank compare
-        num_quant = (p * (n_cols // min(2048, n_cols))) if emit_mx else 0
+        num_quant = (p * (n_cols // qchunk)) if emit_mx else 0
         grid = (1 + num_buf + num_quant,)
         _moe_sorting_small_kernel[grid](
             topk_ids,
@@ -362,7 +365,7 @@ def _run_small_sort(
             num_buf=num_buf,
             EMIT_MX=emit_mx,
             N_COLS=n_cols,
-            QCHUNK=min(2048, n_cols),
+            QCHUNK=qchunk,
             SCALEN_PAD=scalen_pad,
             num_warps=4,
         )
@@ -398,7 +401,7 @@ def _run_small_sort(
         num_buf=num_buf,
         EMIT_MX=emit_mx,
         N_COLS=n_cols,
-        QCHUNK=min(2048, n_cols),
+        QCHUNK=qchunk,
         SCALEN_PAD=scalen_pad,
         num_warps=8,
     )
@@ -444,7 +447,7 @@ def apply_aiter_small_moe_sort_patch() -> None:
             and w1.dtype in (dtypes.fp4x2, dtypes.fp8)
             and hidden_states.dtype in (torch.bfloat16, torch.float16)
             and hidden_states.is_contiguous()
-            and hidden_states.shape[-1] % 2048 == 0
+            and hidden_states.shape[-1] % 1024 == 0
             and topk_ids.numel() <= 256
         )
         input_token = _pending_quant_input.set(hidden_states if emit else None)
