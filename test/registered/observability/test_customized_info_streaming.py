@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import unittest
 
+from sglang.srt.platforms import current_platform
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.customized_info_sampler import (
     CUSTOMIZED_INFO_FIELD,
@@ -20,6 +21,11 @@ _INPUT_IDS = [464, 9345, 3958, 1752, 13]
 _MAX_NEW_TOKENS = 17
 
 
+@unittest.skipIf(
+    current_platform.is_mps(),
+    "The standard Torch MPS path only supports the pytorch sampling backend, "
+    "so the customized-info probe backend cannot be installed there.",
+)
 class TestCustomizedInfoStreaming(CustomTestCase):
     @classmethod
     def setUpClass(cls):
