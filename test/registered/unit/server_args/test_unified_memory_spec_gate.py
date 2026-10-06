@@ -20,17 +20,17 @@ backend constraints:
     `flashinfer` / `fa3`, which includes the MLA family). Its draft fuses
     into the target's pages when the fused-draft decision allows, else keeps
     a private pool, so the gate leaves the draft backend unconstrained.
-  * DFLASH: the target verifies on `triton` / `fa3` / `flashinfer`; the MLA
-    verify family must not leak into this arm.
+  * DFLASH: the target verifies on `triton` / `fa3` / `flashinfer` /
+    `trtllm_mha`; the MLA verify family must not leak into this arm.
   * EAGLE/EAGLE3: unified targets only (hybrid-SWA or mamba hybrids, either
     full-pool kind) -- the draft's KV lives fused inside the full pool's
     page envelope (`DenseDraftRegion`), with an automatic private-pool
     fallback when no region resolves. The target's verify set follows the
     host kind: the audited verify set on an MLA host, `triton` /
-    `flashinfer` / `fa3` on an MHA host, and an unresolved backend is
-    refused. The draft worker (its backend resolves separately: explicit
-    flag first, else it inherits the target's) runs on `triton` /
-    `flashinfer` / `fa3`.
+    `flashinfer` / `fa3` / `trtllm_mha` on an MHA host, and an unresolved
+    backend is refused. The draft worker (its backend resolves separately:
+    explicit flag first, else it inherits the target's) runs on `triton` /
+    `flashinfer` / `fa3` / `trtllm_mha`.
 
 Every arm drafts a linear chain (`--speculative-eagle-topk` in {None, 1}).
 Everything else (NGRAM / STANDALONE / registered customs) stays refused.
@@ -133,7 +133,7 @@ class TestUnifiedMemorySpecGate(unittest.TestCase):
     )
     # The translated MHA rails: the EAGLE and DFLASH arms' target backends
     # on an MHA host, and every fused draft's backend.
-    MHA_RAILS = ("triton", "flashinfer", "fa3")
+    MHA_RAILS = ("triton", "flashinfer", "fa3", "trtllm_mha")
     # Algorithms with no audited unified-pool verify rails.
     # "NEXTN" is deliberately absent: the CLI alias collapses it to
     # "EAGLE" in handle_speculative_decoding BEFORE this gate runs
@@ -153,7 +153,8 @@ class TestUnifiedMemorySpecGate(unittest.TestCase):
             )
 
     def test_dspark_refused_on_unaudited_backends(self):
-        """fa4 and trtllm_mha have no translated spec verify path."""
+        """fa4 has no translated spec verify path, and trtllm_mha is audited
+        only for the EAGLE and DFLASH arms."""
         for backend in ("fa4", "trtllm_mha"):
             self.assertFalse(_accepts("DSPARK", backend=backend))
 
@@ -215,15 +216,15 @@ class TestUnifiedMemorySpecGate(unittest.TestCase):
         )
 
     def test_dflash_admitted_only_on_its_verify_backends(self):
-        """DFLASH's target verifies on triton / fa3 / flashinfer. fa4 and
-        trtllm_mha have no translated spec verify path, and the MLA verify
-        family the DSPARK arm admits must not leak into this arm."""
+        """DFLASH's target verifies on the translated MHA rails. fa4 has no
+        translated spec verify path, and the MLA verify family the DSPARK arm
+        admits must not leak into this arm."""
         for backend in self.MHA_RAILS:
             self.assertTrue(
                 _accepts("DFLASH", backend=backend),
                 f"DFLASH should pass on verify-audited backend {backend}",
             )
-        for backend in ("fa4", "trtllm_mha") + tuple(
+        for backend in ("fa4",) + tuple(
             b for b in self.DSPARK_BACKENDS if b not in self.MHA_RAILS
         ):
             self.assertFalse(
@@ -306,7 +307,7 @@ class TestUnifiedMemorySpecGate(unittest.TestCase):
     def test_eagle_refused_unaudited_backends(self):
         """Unaudited backends stay out, and the MLA verify set from the
         DSPARK arm must not leak into the EAGLE arm."""
-        for backend in ("fa4", "trtllm_mha") + tuple(
+        for backend in ("fa4",) + tuple(
             b for b in self.DSPARK_BACKENDS if b not in self.MHA_RAILS
         ):
             self.assertFalse(_accepts("EAGLE", backend=backend))
@@ -319,13 +320,12 @@ class TestUnifiedMemorySpecGate(unittest.TestCase):
 
     def test_eagle_draft_backend_pinned(self):
         """The draft worker resolves its own backend: unset inherits the
-        target's (triton here), an explicit triton / flashinfer / fa3 passes,
-        and anything else refuses."""
+        target's (triton here), an explicit one on the translated MHA rails
+        passes, and anything else refuses."""
         self.assertTrue(_accepts("EAGLE", draft_backend=None))
         for draft_backend in self.MHA_RAILS:
             self.assertTrue(_accepts("EAGLE", draft_backend=draft_backend))
-        for draft_backend in ("fa4", "trtllm_mha"):
-            self.assertFalse(_accepts("EAGLE", draft_backend=draft_backend))
+        self.assertFalse(_accepts("EAGLE", draft_backend="fa4"))
 
     def test_hierarchical_cache_refused_with_an_eagle_draft(self):
         """Under HiCache an EAGLE draft keeps a private pool, and an MTP
