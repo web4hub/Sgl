@@ -19,6 +19,8 @@ import sys
 
 import pytest
 import torch
+import triton
+import triton.language as tl
 
 from sglang.kernels.ops.attention.deepseek_v4_rope import precompute_freqs_cis
 from sglang.kernels.ops.attention.dsv4 import (
@@ -26,14 +28,19 @@ from sglang.kernels.ops.attention.dsv4 import (
     compress_norm_rope_store,
 )
 from sglang.kernels.ops.attention.dsv4.compress import CompressorPrefillPlan
-from sglang.kernels.ops.attention.dsv4.fp4_indexer import quantize_fp4_indexer_tensor
+from sglang.kernels.ops.attention.dsv4.fp4_indexer import (
+    _fp4_e2m1_code_rne,
+    quantize_fp4_indexer_tensor,
+)
 from sglang.kernels.ops.attention.dsv4.fp4_indexer_hip import (
     FP4KWriteMetadata,
     _decode_cta_count,
+    _fp4_e2m1_code_rne_lean,
     _guard_page_table,
     aiter_fp4_paged_mqa_logits,
     aiter_k_indexer_fp4_cache_write,
     aiter_q_indexer_fp4,
+    index_q_rope_pack_flydsl,
     index_q_rope_pack_weights_flydsl,
     indexer_head_weights,
     pack_fp4_query_flydsl,
@@ -330,6 +337,63 @@ def test_index_q_pack_weights_matches_standalone() -> None:
         weights.view(torch.int16).int() - exact_weights.view(torch.int16).int()
     ).abs()
     assert int(ulps.max()) <= 1
+
+
+@pytest.mark.parametrize("num_heads", [16, 32, 64])
+@pytest.mark.parametrize("num_tokens", [1, 333, 16384])
+def test_index_q_rope_pack_matches_standalone(num_tokens: int, num_heads: int) -> None:
+    """The prefill index-Q launch (RoPE and two-stage fp4 pack in the FlyDSL layout) is
+    bitwise the two standalone launches it replaces, past the decode path's 4096-row cap."""
+
+    torch.manual_seed(0)
+    rope_dim, max_pos = 64, 65536
+    q = (torch.randn(num_tokens, num_heads * 128, device="cuda") * 3).bfloat16()
+    # rows small enough to reach both quantizers' amax floors
+    q[: num_tokens // 10 + 1] *= 1e-6
+    if num_tokens > 4:
+        # groups whose reciprocal scales take the inf / nan / near-overflow branches
+        q[1, 3] = float("inf")
+        q[2, 200] = float("nan")
+        q[3, :128] = 3.0e38
+        q[4, 64:] = float("-inf")
+    freqs = precompute_freqs_cis(rope_dim, max_pos, 0, 10000, 1, 32, 1).to("cuda")
+    pos = torch.randint(0, max_pos, (num_tokens,), device="cuda", dtype=torch.int64)
+
+    ref_q = rope_tail_fake_quant_fp4(
+        q.view(num_tokens, num_heads, 128), freqs, rope_dim, positions=pos
+    )
+    ref_fp4, ref_scale = pack_fp4_query_flydsl(ref_q)
+    q_fp4, q_scale = index_q_rope_pack_flydsl(
+        q, freqs, pos, rope_dim, num_heads=num_heads
+    )
+    assert q_fp4.dtype == ref_fp4.dtype and q_scale.dtype == ref_scale.dtype
+    assert torch.equal(q_fp4, ref_fp4)
+    assert torch.equal(q_scale, ref_scale)
+
+
+@triton.jit
+def _e2m1_codes_kernel(x_ptr, ref_ptr, lean_ptr, n, BLOCK: tl.constexpr):
+    offs = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    mask = offs < n
+    x = tl.load(x_ptr + offs, mask=mask)
+    tl.store(ref_ptr + offs, _fp4_e2m1_code_rne(x), mask=mask)
+    tl.store(lean_ptr + offs, _fp4_e2m1_code_rne_lean(x), mask=mask)
+
+
+def test_fp4_e2m1_code_rne_lean_matches() -> None:
+    """The prefill index-Q kernel's e2m1 code equals _fp4_e2m1_code_rne on every bf16 value
+    (all the kernel feeds it: bf16 values times a power of two) and on random fp32 bits."""
+    every_bf16 = torch.arange(1 << 16, dtype=torch.int32).to(torch.int16)
+    every_bf16 = every_bf16.view(torch.bfloat16).float()
+    scaled = torch.cat([every_bf16 * 2.0**k for k in (-8, -1, 0, 1, 8)])
+    random_bits = torch.randint(-(1 << 31), 1 << 31, (1 << 22,), dtype=torch.int64)
+    x = torch.cat([scaled, random_bits.to(torch.int32).view(torch.float32)]).cuda()
+    ref = torch.empty(x.shape, dtype=torch.uint8, device="cuda")
+    lean = torch.empty_like(ref)
+    _e2m1_codes_kernel[(triton.cdiv(x.numel(), 1024),)](
+        x, ref, lean, x.numel(), BLOCK=1024
+    )
+    assert torch.equal(lean, ref)
 
 
 @pytest.mark.parametrize("num_tokens", [1, 16, 96])
