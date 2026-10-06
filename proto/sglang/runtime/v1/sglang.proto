@@ -135,6 +135,7 @@ message GenerateRequest {
   optional bool require_reasoning = 15;
   optional uint32 max_thinking_tokens = 16;
   optional KVHintsEnvelope kv_hints = 17;
+  repeated string image_data = 18;
 }
 
 // Versioned KV-hint envelope forwarded from a trusted orchestrator.
