@@ -329,6 +329,9 @@ pub(crate) fn build_generate_dict(
     let mut d = HashMap::new();
     d.insert("rid".into(), serde_json::json!(rid));
     d.insert("input_ids".into(), serde_json::json!(req.input_ids));
+    if !req.image_data.is_empty() {
+        d.insert("image_data".into(), serde_json::json!(req.image_data));
+    }
     d.insert(
         "sampling_params".into(),
         sampling_params_to_map(&req.sampling_params)?,
@@ -598,6 +601,44 @@ mod tests {
         for request in [text_request, token_request] {
             assert!(!request.contains_key("kv_hints"));
         }
+    }
+
+    #[test]
+    fn tokenized_generate_dict_preserves_multimodal_disaggregated_fields() {
+        let request = proto::GenerateRequest {
+            input_ids: vec![2, 10, 20],
+            image_data: vec![
+                "https://example.com/image.png".to_string(),
+                "data:image/png;base64,aW1hZ2U=".to_string(),
+            ],
+            disaggregated_params: Some(proto::DisaggregatedParams {
+                bootstrap_host: "10.0.0.1".to_string(),
+                bootstrap_port: 8998,
+                bootstrap_room: i64::MAX,
+            }),
+            ..Default::default()
+        };
+
+        let mapped = build_generate_dict("request", &request).unwrap();
+
+        assert_eq!(mapped["input_ids"], serde_json::json!([2, 10, 20]));
+        assert_eq!(
+            mapped["image_data"],
+            serde_json::json!([
+                "https://example.com/image.png",
+                "data:image/png;base64,aW1hZ2U="
+            ])
+        );
+        assert_eq!(mapped["bootstrap_host"], serde_json::json!("10.0.0.1"));
+        assert_eq!(mapped["bootstrap_port"], serde_json::json!(8998));
+        assert_eq!(mapped["bootstrap_room"], serde_json::json!(i64::MAX));
+    }
+
+    #[test]
+    fn tokenized_generate_dict_omits_empty_image_data() {
+        let mapped = build_generate_dict("request", &proto::GenerateRequest::default()).unwrap();
+
+        assert!(!mapped.contains_key("image_data"));
     }
 
     #[test]
