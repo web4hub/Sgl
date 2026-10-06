@@ -1270,19 +1270,14 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             else:
                 metadata.cu_seqlens_q = metadata.cu_seqlens_k
 
-        kv_view = self.kv_index_translator.read_table(
-            forward_batch.kv_loc_plan, rows=forward_batch.batch_size
-        )
-        if kv_view.is_translated:
-            # No fill kernel: the kernels take the tensor's own width/stride
-            # and bound their reads by cache_seqlens.
-            metadata.page_table = kv_view.ids
+        if self.kv_index_translator.reads_are_translated:
+            # As wide as the captured and static tables: XQA sizes its multi-block
+            # split from the width, so a narrower table changes the output's rounding.
+            metadata.page_table = self._plan_table_at_captured_width(forward_batch)
             metadata.swa_page_table = (
-                self.kv_index_translator.read_table(
-                    forward_batch.kv_loc_plan,
-                    kind=IdSpaceKind.SLIDING_WINDOW,
-                    rows=forward_batch.batch_size,
-                ).ids
+                self._plan_table_at_captured_width(
+                    forward_batch, IdSpaceKind.SLIDING_WINDOW
+                )
                 if self.kv_index_translator.space(IdSpaceKind.SLIDING_WINDOW)
                 is not None
                 else None
@@ -1320,6 +1315,19 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             )
 
         self.forward_metadata = metadata
+
+    def _plan_table_at_captured_width(
+        self, forward_batch: ForwardBatch, kind: IdSpaceKind = IdSpaceKind.FULL
+    ) -> torch.Tensor:
+        table = torch.empty(
+            (forward_batch.batch_size, self.max_num_pages),
+            dtype=torch.int32,
+            device=forward_batch.seq_lens.device,
+        )
+        self.kv_index_translator.copy_page_table(
+            forward_batch.kv_loc_plan, out=table, kind=kind
+        )
+        return table
 
     def _reshape_paged_kv_cache(
         self,
