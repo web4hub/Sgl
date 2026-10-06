@@ -163,6 +163,7 @@ from sglang.srt.managers.io_struct import (
     PauseGenerationReqInput,
     PdRoleSwitchReqInput,
     ProfileReq,
+    PullWeightsReqInput,
     ReleaseMemoryOccupationReqInput,
     RemoveExternalCorpusReqInput,
     RemoveExternalCorpusReqOutput,
@@ -276,6 +277,7 @@ from sglang.srt.managers.scheduler_components.recv_skipper import (
 from sglang.srt.managers.scheduler_components.request_receiver import (
     SchedulerRequestReceiver,
 )
+from sglang.srt.managers.scheduler_components.weight_puller import SchedulerWeightPuller
 from sglang.srt.managers.scheduler_components.weight_updater import (
     SchedulerWeightUpdaterManager,
 )
@@ -1778,6 +1780,7 @@ class Scheduler(
                     CheckWeightsReqInput,
                     self.weight_updater.check_weights,
                 ),
+                (PullWeightsReqInput, self.weight_puller.handle),
                 (SlowDownReqInput, self.slow_down),
                 (PdRoleSwitchReqInput, self.handle_pd_role_switch),
                 (
@@ -2125,6 +2128,7 @@ class Scheduler(
                     self.ipc_channels.send_to_tokenizer.send_output(output, recv_req)
 
         self.flush_wrapper.check_pending()
+        self.weight_puller.check_pending()
         if self.external_corpus_manager is not None:
             self.external_corpus_manager.check_pending_load()
 
@@ -2236,6 +2240,9 @@ class Scheduler(
             is_fully_idle=self.is_fully_idle,
             scheduler=self,
             metrics_collector=self.metrics_collector,
+        )
+        self.weight_puller = SchedulerWeightPuller(
+            tp_cpu_group=self.tp_cpu_group, ipc_channels=self.ipc_channels
         )
 
     def init_lora_drainer(self) -> None:
