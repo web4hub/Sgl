@@ -35,6 +35,7 @@ from sglang.srt.runtime_context import (
     get_spec,
     max_prefill_buffer_tokens,
 )
+from sglang.srt.speculative.spec_info import supports_dummy_draft_extend
 from sglang.srt.utils import empty_context, log_info_on_rank0
 
 if TYPE_CHECKING:
@@ -358,50 +359,38 @@ def maybe_flashinfer_autotune_extend(
     num_tokens = max_prefill_buffer_tokens() or get_schedule().max_prefill_tokens
     if num_tokens <= (decode_num_tokens or 0):
         return  # decode-shaped autotune already covered these buckets
-    # DSpark's dummy forward is TARGET_VERIFY-shaped and misses large prefill GEMMs.
-    prefill_autotune = getattr(mr.model, "autotune_prefill_kernels", None)
-    wants_prefill_autotune = getattr(mr.model, "wants_prefill_autotune", None)
-    if wants_prefill_autotune is not None and not wants_prefill_autotune():
-        # Entering the autotune context loads / saves the tactic cache and syncs
-        # ranks, so a model that has nothing to tune must decline before it.
-        prefill_autotune = None
-    if prefill_autotune is not None and mr.is_generation and not mr.is_draft_worker:
-        with flashinfer_autotune_context(mr, run_lm_head=False):
-            tuned = prefill_autotune(num_tokens, dtype=mr.dtype)
-        if tuned:
-            return
-
-    if not envs.SGLANG_FLASHINFER_AUTOTUNE_EXTEND.get():
+    if not mr.is_generation or get_disagg().disaggregation_mode == "decode":
         return
-    is_pd_prefill_target = (
-        get_disagg().disaggregation_mode == "prefill" and not mr.is_draft_worker
-    )
-    if not mr.is_generation or (
-        mr.spec_algorithm.is_speculative() and not is_pd_prefill_target
-    ):
-        # Ordinary speculative runners force TARGET_VERIFY; PD prefill targets
-        # have no draft-side state and preserve the requested EXTEND mode.
+    if mr.is_draft_worker and not supports_dummy_draft_extend(mr.spec_algorithm):
         return
-    # Multimodal generation wrappers can still run this text-only EXTEND dummy;
-    # an incompatible model should fail the explicit opt-in visibly.
 
     if mr.attn_backend.extend_dummy_seqs_capped_by_req_pool:
         pool_size = mr.req_to_token_pool.size
-        num_tokens_per_req = (num_tokens + pool_size - 1) // pool_size
+        per_req = (num_tokens + pool_size - 1) // pool_size
     else:
-        # Packed dummies tune measurably worse tactics for the same token
-        # bucket, so pack only where the backend would otherwise crash. None
-        # (not 1) keeps the backend's own seq_len_fill_value in _dummy_run.
-        num_tokens_per_req = None
-    per_req = num_tokens_per_req or 1
-    batch_size = (num_tokens + per_req - 1) // per_req
+        per_req = 1
+    batch_size = num_tokens // per_req
     num_tokens = batch_size * per_req
 
-    buffers = runner._alloc_dummy_decode_buffers(
-        batch_size,
-        num_tokens_per_req=per_req,
-        allocate_logits_buffer=False,
-    )
+    sync_group = _autotune_tactic_sync_group(get_parallel().tp_group)
+    try:
+        buffers = runner._alloc_dummy_decode_buffers(
+            batch_size,
+            num_tokens_per_req=per_req,
+            allocate_logits_buffer=False,
+            allocate_input_embeds=False,
+        )
+    except torch.OutOfMemoryError:
+        buffers = None
+    if not _all_ranks_agree(ok=buffers is not None, group=sync_group):
+        del buffers
+        torch.cuda.empty_cache()
+        log_info_on_rank0(
+            logger,
+            "FlashInfer extend autotune skipped: not enough free memory "
+            f"for {num_tokens}-token dummy buffers.",
+        )
+        return
     canary_run_ctx = (
         c.with_active_single_forward_manager(0)
         if (c := mr.canary_manager) is not None
@@ -414,7 +403,7 @@ def maybe_flashinfer_autotune_extend(
         buffers=buffers,
         run_ctx=canary_run_ctx,
         forward_mode_override=ForwardMode.EXTEND,
-        extend_num_tokens_per_req=num_tokens_per_req,
+        extend_num_tokens_per_req=per_req,
     )
 
     log_info_on_rank0(
@@ -425,7 +414,7 @@ def maybe_flashinfer_autotune_extend(
     try:
         run_flashinfer_autotune_forward(mr, forward_fn, run_lm_head=False)
     except torch.OutOfMemoryError:
-        if _autotune_tactic_sync_group(get_parallel().tp_group) is not None:
+        if sync_group is not None:
             # Tuning is collective: this rank has stopped reducing while its
             # peers wait on the next tactic, so skipping the pass would hang
             # them. Fail instead of degrading alone.
@@ -441,3 +430,13 @@ def maybe_flashinfer_autotune_extend(
         # release dummy buffers before capture measures free memory
         del forward_fn, buffers
         torch.cuda.empty_cache()
+
+
+def _all_ranks_agree(
+    *, ok: bool, group: Optional[torch.distributed.ProcessGroup]
+) -> bool:
+    if group is None:
+        return ok
+    flag = torch.tensor([int(ok)], dtype=torch.int32)
+    torch.distributed.all_reduce(flag, op=torch.distributed.ReduceOp.MIN, group=group)
+    return bool(flag.item())
