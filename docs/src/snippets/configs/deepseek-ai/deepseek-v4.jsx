@@ -309,7 +309,7 @@ sgl-eval run mmmu_pro \\
             flags: ["--moe-a2a-backend deepep"],
             hide: { hw: ["mi300x", "mi355x"] } },
           // MORI's expert all-to-all — the dispatch/combine backend the AMD
-          // recipes use, and what the §3.8 decode role runs. Hidden on every
+          // recipes use, and what the §3.9 decode role runs. Hidden on every
           // non-ROCm platform, the same way the MORI transfer backend is in the
           // PD card.
           { id: "mori",              label: "MORI",
@@ -333,7 +333,7 @@ sgl-eval run mmmu_pro \\
           // MODE is deliberately NOT emitted: STATIC_HEAP is MORI's own default,
           // so on this card it would be pure noise. The PD prefill role sets it
           // because the recipe it mirrors runs under a launcher that exports
-          // ISOLATION. See cookbook §3.7 / §3.8.
+          // ISOLATION. See cookbook §3.8 / §3.9.
           { id: "megamoe",           label: "MegaMoE",
             // Same flag, two implementations. On ROCm it is Aiter MegaMoEv2,
             // which reaches its dispatch/combine buffers through MORI's
@@ -410,7 +410,7 @@ sgl-eval run mmmu_pro \\
           hide: { variant: ["flash", "pro"] },
           disable: [
             { when: { dpAttnOn: [true] },
-              reason: "DSpark is not compatible with DP Attention on the current release. For a DP + DSpark agentic recipe, see the cookbook §3.6 (B200) / §3.7 (MI355X) notes." },
+              reason: "DSpark is not compatible with DP Attention on the current release. For a DP + DSpark agentic recipe, see the cookbook §3.6 (B200) / §3.7 (B300) / §3.8 (MI355X) notes." },
             { when: { hw: ["mi300x"] },
               reason: "DSpark on ROCm is documented for MI355X Pro Official (0813); MI300X still requires CUDA." },
           ] },
@@ -539,7 +539,7 @@ sgl-eval run mmmu_pro \\
       // None of these roles re-value --mem-fraction-static or
       // --swa-full-tokens-ratio: the base cell's values stand, so the rendered
       // command differs from the Deploy command only where the ROLE differs.
-      // High-throughput is the exception and still sets 0.92, which the §3.8
+      // High-throughput is the exception and still sets 0.92, which the §3.9
       // MegaMoE heap sizing depends on.
       //
       // The base cell's --prefill-decode-interval and the decode role's
@@ -904,11 +904,11 @@ sgl-eval run mmmu_pro \\
       // by rank, so an 8-rank worker under pure TP opens eight keyspaces holding
       // eight copies of the same MLA KV, and the tier holds an eighth of the
       // distinct tokens its byte budget suggests. DP attention collapses the
-      // keys onto one shared keyspace. Cookbook §3.9 explains the trade.
+      // keys onto one shared keyspace. Cookbook §3.10 explains the trade.
       //
       // The Pro Official prefill roles ship with the linker on. The tier lives
       // in a standalone umbp_standalone_server on the prefill node (cookbook
-      // §3.9), reached over the socket in UMBP_STANDALONE_ADDRESS.
+      // §3.10), reached over the socket in UMBP_STANDALONE_ADDRESS.
       roleOverrides: [
         { mode: "prefill",
           when: { hw: ["mi355x"], variant: ["pro-official"], quant: ["fp4"],
@@ -916,7 +916,7 @@ sgl-eval run mmmu_pro \\
           enable: true,
           env: ["UMBP_STANDALONE_ADDRESS=unix:///tmp/umbp_sa/sa.grpc.sock"],
           flags: ["--hicache-storage-backend-extra-config '{\"standalone_startup_timeout_ms\":120000}'"],
-          note: "Start the UMBP tier server on the prefill node first (cookbook §3.9): UMBP_DRAM_CAPACITY=1500000000000 UMBP_DRAM_USE_HUGEPAGES=1 UMBP_SSD_ENABLED=0 umbp_standalone_server unix:///tmp/umbp_sa/sa.grpc.sock" },
+          note: "Start the UMBP tier server on the prefill node first (cookbook §3.10): UMBP_DRAM_CAPACITY=1500000000000 UMBP_DRAM_USE_HUGEPAGES=1 UMBP_SSD_ENABLED=0 umbp_standalone_server unix:///tmp/umbp_sa/sa.grpc.sock" },
       ],
       defaultBackend: "mori",
       backends: [
@@ -958,7 +958,7 @@ sgl-eval run mmmu_pro \\
           { id: "6", label: "6", flags: ["--speculative-dspark-block-size 6"] },
         ],
       },
-      // The MI355X Pro Official DP-attention PD arm (§3.8 high-throughput) runs
+      // The MI355X Pro Official DP-attention PD arm (§3.9 high-throughput) runs
       // ONE shape from concurrency 192 to 512. The point only moves two numbers,
       // and both are derived rather than tuned: admission is 2x the target
       // concurrency on both roles, and decode captures graphs up to admission /
@@ -2293,7 +2293,7 @@ sgl-eval run mmmu_pro \\
     // MI355X + FP4 — Pro Official (0813)
     // Bundled DSpark head. Low-latency is TP-only + DSPARK; balanced /
     // high-throughput stay target-only in the Deploy panel (DP Attention).
-    // The DP + DSpark agentic path is documented in cookbook §3.7.
+    // The DP + DSpark agentic path is documented in cookbook §3.8.
     // ====================================================================
     {
       match: { hw: "mi355x", variant: "pro-official", quant: "fp4", strategy: "low-latency", nodes: "single" },
@@ -2318,7 +2318,7 @@ sgl-eval run mmmu_pro \\
       ],
     },
     {
-      // DSpark + DP Attention is documented in cookbook §3.7, not this cell.
+      // DSpark + DP Attention is documented in cookbook §3.8, not this cell.
       match: { hw: "mi355x", variant: "pro-official", quant: "fp4", strategy: "balanced", nodes: "single" },
       verified: false,
       env: ["SGLANG_USE_ROCM700A=0", "TORCH_BLAS_PREFER_HIPBLASLT=1", "SGLANG_SHARED_EXPERT_TP1=1", "SGLANG_DP_SHARED_EXPERT_LOCAL=1", "SGLANG_DP_USE_GATHERV=1", "SGLANG_DP_USE_REDUCE_SCATTER=1", "SGLANG_HACK_FLASHMLA_BACKEND=unified_kv_triton", "AITER_BF16_FP8_MOE_BOUND=0", "SGLANG_OPT_USE_AITER_BATCHED_GEMM=true"],
@@ -2344,8 +2344,8 @@ sgl-eval run mmmu_pro \\
       ],
     },
     {
-      // DSpark + DP Attention is documented in cookbook §3.7 and in the PD roles
-      // above (§3.8), not this cell.
+      // DSpark + DP Attention is documented in cookbook §3.8 and in the PD roles
+      // above (§3.9), not this cell.
       match: { hw: "mi355x", variant: "pro-official", quant: "fp4", strategy: "high-throughput", nodes: "single" },
       verified: false,
       env: ["SGLANG_USE_ROCM700A=0", "TORCH_BLAS_PREFER_HIPBLASLT=1", "SGLANG_SHARED_EXPERT_TP1=1", "SGLANG_DP_SHARED_EXPERT_LOCAL=1", "SGLANG_DP_USE_GATHERV=1", "SGLANG_DP_USE_REDUCE_SCATTER=1", "SGLANG_HACK_FLASHMLA_BACKEND=unified_kv_triton", "AITER_BF16_FP8_MOE_BOUND=0", "SGLANG_OPT_USE_AITER_BATCHED_GEMM=true"],
