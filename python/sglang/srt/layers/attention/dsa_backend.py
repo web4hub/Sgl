@@ -96,6 +96,7 @@ from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 
 _IS_GFX95 = is_gfx95_supported()
 
+
 if is_cuda():
     import deep_gemm
 
@@ -566,6 +567,43 @@ class DeepseekSparseAttnBackend(
             self.device_capability = torch.cuda.get_device_capability()
         self.device_sm_major = self.device_capability[0]
         self.kv_cache_dtype = model_runner.kv_cache_dtype
+        self._triton_kpool_tail_supported = False
+        if self.dsa_index_kpool > 1 and (
+            self.dsa_prefill_impl == "triton" or self.dsa_decode_impl == "triton"
+        ):
+            from sglang.kernels.ops.attention.dsa.triton_sparse_mla import (
+                can_use_glm53_triton_sparse_attention,
+            )
+
+            topk_width = self.dsa_index_topk + self.dsa_index_kpool - 1
+            self._triton_kpool_tail_supported = can_use_glm53_triton_sparse_attention(
+                q_dtype=model_runner.dtype,
+                kv_dtype=self.kv_cache_dtype,
+                num_tokens=None,
+                num_heads=self.num_q_heads,
+                q_nope_dim=self.kv_lora_rank,
+                q_rope_dim=self.qk_rope_head_dim,
+                kv_dim=self.kv_cache_dim,
+                d_v=self.kv_lora_rank,
+                topk_width=topk_width,
+                dsa_index_topk=self.dsa_index_topk,
+                dsa_index_kpool=self.dsa_index_kpool,
+            )
+            if not self._triton_kpool_tail_supported:
+                raise ValueError(
+                    "Triton with index_kpool > 1 is only validated for GLM-5.3 "
+                    "on gfx950 with BF16 Q/KV, 8 or 16 query heads, zero-width "
+                    "RoPE, 512-wide Q/KV/output, index_topk=2048, "
+                    "and index_kpool=4; got "
+                    f"model_dtype={model_runner.dtype}, "
+                    f"kv_cache_dtype={self.kv_cache_dtype}, "
+                    f"num_q_heads={self.num_q_heads}, "
+                    f"q_nope_dim={self.kv_lora_rank}, "
+                    f"q_rope_dim={self.qk_rope_head_dim}, "
+                    f"kv_dim={self.kv_cache_dim}, "
+                    f"index_topk={self.dsa_index_topk}, "
+                    f"index_kpool={self.dsa_index_kpool}."
+                )
 
         # `flashmla_sparse_q8` = the native FP8 SM90 sparse-prefill kernel. It always
         # runs FP8 (requires fp8_e4m3 KV) and is SM90-only, so validate both at
@@ -2176,12 +2214,8 @@ class DeepseekSparseAttnBackend(
             ).to(torch.int32)
 
         if dsa_impl == "tilelang":
-            if q_rope is not None:
-                # Cat-skip, as in forward_decode: q_rope=None means the caller
-                # already handed us the concatenated form and q_all is a
-                # zero-copy view of it. `not _is_hip` keeps CUDA byte-identical.
-                if q_all is None or not _is_hip:
-                    q_all = concat_mla_absorb_q_general(q_nope, q_rope)
+            if q_all is None or not _is_hip:
+                q_all = concat_mla_absorb_q_general(q_nope, q_rope)
             return self._forward_tilelang(
                 q_all=q_all,
                 kv_cache=kv_cache,
@@ -2506,10 +2540,6 @@ class DeepseekSparseAttnBackend(
                 page_table_1=page_table_1,
             )
         elif dsa_impl == "tilelang":
-            # Cat-skip (HIP-only): when caller passes q_rope=None on HIP, q_all
-            # has already been set to a zero-copy view of q in the else branch
-            # above and we can reuse it directly. The `not _is_hip` clause keeps
-            # CUDA / MUSA paths byte-identical to pre-patch by always re-cat.
             if q_all is None or not _is_hip:
                 q_all = concat_mla_absorb_q_general(q_nope, q_rope)
             return self._forward_tilelang(
