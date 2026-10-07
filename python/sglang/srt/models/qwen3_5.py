@@ -2279,6 +2279,12 @@ class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration):
         self.deepstack_visual_indexes = (
             self.visual.deepstack_visual_indexes if self.visual is not None else []
         )
+        from sglang.srt.layers.clef import load_clef_head
+        from sglang.srt.layers.clef_logits_processor import ClefLogitsProcessor
+
+        clef_head = load_clef_head(self.lm_head, quant_config)
+        if clef_head is not None:
+            self.logits_processor = ClefLogitsProcessor(self.config, clef_head)
 
     def get_hidden_dim(self, module_name: str, layer_idx: int):
         return self.model.get_hidden_dim(module_name, layer_idx)
