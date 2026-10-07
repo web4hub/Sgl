@@ -69,6 +69,26 @@ class TestLLGuidanceBatchedMask(unittest.TestCase):
         self.assertTrue(torch.equal(serial, batched))
         self.assertTrue((batched[1] == -1).all())
 
+    def test_termination_survives_scheduler_finished_sync(self):
+        tokenizer = self.template.llguidance_tokenizer
+        grammar = GuidanceGrammar(
+            llguidance_tokenizer=tokenizer,
+            serialized_grammar=grammar_from("regex", "ab"),
+        )
+        for token in tokenizer.tokenize_str("ab"):
+            grammar.accept_token(token)
+        grammar.accept_token(tokenizer.eos_token)
+        self.assertTrue(grammar.is_terminated())
+
+        # The scheduler writes the request's finish state into grammar.finished;
+        # a request that keeps decoding (ignore_eos) must stay unconstrained.
+        grammar.finished = False
+        self.assertTrue(grammar.is_terminated())
+        self.assertTrue((self._batched([grammar]) == -1).all())
+
+        grammar.rollback(1)
+        self.assertFalse(grammar.is_terminated())
+
     def test_unsupported_entry_uses_serial_fill(self):
         mask = self._allocate(self._fresh(1))
         fallback = MagicMock()
