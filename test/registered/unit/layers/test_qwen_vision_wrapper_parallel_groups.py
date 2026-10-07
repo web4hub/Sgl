@@ -1,6 +1,5 @@
 """Qwen vision wrappers and generation helpers retain their placement policies."""
 
-import inspect
 import unittest
 from contextlib import nullcontext
 from unittest.mock import Mock, patch
@@ -14,28 +13,17 @@ from sglang.srt.layers.linear import (
     ReplicatedLinear,
     RowParallelLinear,
 )
-from sglang.srt.runtime_context import SpawnRanks, get_parallel, publish, reset_context
+from sglang.srt.runtime_context import SpawnRanks, reset_context
 from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.parallel_groups import parallel_scope, publish, rank_size
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 
 def group_kwargs(cls, group):
-    if group is None:
-        return {}
-    if "parallel_group" in inspect.signature(cls).parameters:
-        return dict(parallel_group=group)
-    p = get_parallel()
-    rank, size = (
-        (0, 1)
-        if group == "replicated"
-        else (p.tp_rank, p.tp_size)
-        if group == "tp"
-        else (p.attn_tp_rank, p.attn_tp_size)
-    )
-    return dict(tp_rank=rank, tp_size=size)
+    return {} if group is None else dict(parallel_group=group)
 
 
 def build_qwen(model, group=None, *, replicated=False, width=32, quant_config=None):
@@ -86,7 +74,7 @@ def build_qwen(model, group=None, *, replicated=False, width=32, quant_config=No
 
 def load_projection(layer):
     """Load known full weights under rank zero, returning the expected owned shard."""
-    rank, size = getattr(layer, "tp_rank", 0), getattr(layer, "tp_size", 1)
+    rank, size = rank_size(layer)[0], rank_size(layer)[1]
     row = isinstance(layer, RowParallelLinear)
     dtype, device = layer.weight.dtype, layer.weight.device
 
@@ -100,7 +88,7 @@ def load_projection(layer):
             / 128
         ).to(dtype)
 
-    with get_parallel().override(tp_rank=0, attn_dp_rank=0, attn_tp_rank=0):
+    with parallel_scope(tp_rank=0, attn_dp_rank=0, attn_tp_rank=0):
         if isinstance(layer, QKVParallelLinear):
             weights, biases = [], []
             for offset, shard_id in enumerate(("q", "k", "v")):
@@ -204,6 +192,9 @@ class TestQwenVisionWrapperGroups(CustomTestCase):
                             if selected == "tp"
                             else (3 % (4 // dp), 4 // dp)
                         )
+                        self.assertIs(module.tp_group, layers[0].tp_group)
+                        self.assertFalse(hasattr(module, "tp_rank"))
+                        self.assertFalse(hasattr(module, "tp_size"))
                         for index, layer in enumerate(layers):
                             weight, bias = load_projection(layer)
                             row = isinstance(layer, RowParallelLinear)
@@ -222,9 +213,7 @@ class TestQwenVisionWrapperGroups(CustomTestCase):
                             tp.all_reduce.reset_mock()
                             attn.all_reduce.reset_mock()
                             with (
-                                get_parallel().override(
-                                    tp_group=tp, attn_tp_group=attn
-                                ),
+                                parallel_scope(tp_group=tp, attn_tp_group=attn),
                                 patch(
                                     "sglang.srt.layers.linear.is_allocation_symmetric",
                                     return_value=False,
@@ -254,8 +243,8 @@ class TestQwenVisionWrapperGroups(CustomTestCase):
                                 )
                             self.assertEqual(
                                 (
-                                    getattr(layer, "tp_rank", 0),
-                                    getattr(layer, "tp_size", 1),
+                                    rank_size(layer)[0],
+                                    rank_size(layer)[1],
                                 ),
                                 (expected_rank, expected_size),
                             )
