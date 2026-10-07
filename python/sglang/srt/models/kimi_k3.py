@@ -147,7 +147,6 @@ from sglang.srt.utils.common import (
     add_prefix,
     get_bool_env_var,
     rank0_log,
-    require_mlp_sync,
     set_weight_attrs,
 )
 
@@ -2465,20 +2464,14 @@ def _fuses_attn_all_reduce(config: KimiLinearConfig) -> bool:
 
 def _uses_stage_boundaries(config: KimiLinearConfig) -> bool:
     """Whether the layers build stage boundaries, which is the same for every
-    layer of a stack. These still run the layer's own communication: a dense
-    MLP sharded over attention TP; an attention-residual bank whose o_proj
-    all-reduce is fused with the pending add, or whose MoE on its attention-TP
-    token shard (SP-MoE) uses K3's tuned SP collectives, which the sharded
-    carry also needs; and SP-MoE on batches that are not padded to a multiple
-    of attention TP (--disable-attn-tp-gather)."""
-    if get_parallel().enable_dense_mlp_attn_tp and is_dp_attention_enabled():
-        return False
+    layer of a stack. These still run the layer's own communication: an
+    attention-residual bank whose o_proj all-reduce is fused with the pending
+    add, or whose MoE on its attention-TP token shard (SP-MoE) uses K3's tuned
+    SP collectives, which the sharded carry also needs."""
     if _fuses_attn_all_reduce(config):
         return False
     if not _shards_moe_rows():
         return True
-    if not require_mlp_sync():
-        return False
     return config.attn_res_block_size is None or not k3_sp_collective.enabled()
 
 
@@ -2664,6 +2657,11 @@ class KimiK3DecoderLayer(nn.Module):
                         **ffn_ops,
                         sparse=self._is_moe_layer,
                         next_layer_sparse=_is_moe_layer(config, layer_idx + 1),
+                        dense_tp_size=(
+                            get_parallel().attn_tp_size
+                            if not self._is_moe_layer and self.mlp._dense_attn_tp
+                            else None
+                        ),
                         # SP-MoE runs on this rank's attention-TP shard of the
                         # rows; on the bank path, whose reads write the bank on
                         # every row, its output returns to all of them.
