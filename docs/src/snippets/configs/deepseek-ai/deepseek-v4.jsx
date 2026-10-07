@@ -186,6 +186,9 @@ export const config = {
     PORT:      { target: "command", label: "Bind port",       default: "30000"    },
     NODE0_IP:  { target: "command", label: "Head node IP",    default: "<node0-ip>"   },
     NODE_RANK: { target: "command", label: "This node rank",  default: "<node-rank>"  },
+    NODE_IP:   { target: "command", label: "This node fabric IP", default: "<fabric-ip>" },
+    MOONCAKE_MASTER: { target: "command", label: "Mooncake master", default: "<master-ip>:50051" },
+    MOONCAKE_METADATA: { target: "command", label: "Mooncake metadata", default: "http://<master-ip>:8080/metadata" },
     HF_TOKEN:  { target: "command", label: "HF token (Docker)", default: "<your-hf-token>" },
     CURL_HOST: { target: "curl",    label: "Server host",     default: "localhost" },
     CURL_PORT: { target: "curl",    label: "Server port",     default: "30000"     },
@@ -1014,10 +1017,10 @@ sgl-eval run mmmu_pro \\
     // are alternatives and sglang rejects them together. Enabling this card
     // therefore strips the HiCache family from the command.
     //
-    // ROCm-only in practice: the store is MORI's buffer pool, the same
-    // transport the PD roles use, and there is no CUDA recipe for it yet.
+    // The GB300 Pro Official FP4 recipe can opt into Mooncake; its standalone
+    // master and stores must be started first (cookbook §3.10).
     umbp: {
-      onlyHw: ["mi300x", "mi355x"],
+      onlyHw: ["mi300x", "mi355x", "gb300"],
       // No `requiresDpAttention`: the linker runs under pure TP as well, and the
       // TP-only Pro Official prefill roles below are that shape.
       // DP attention is a sizing question, not a prerequisite — the linker keys
@@ -1036,11 +1039,26 @@ sgl-eval run mmmu_pro \\
           enable: true,
           env: ["UMBP_STANDALONE_ADDRESS=unix:///tmp/umbp/standalone.grpc.sock"],
           note: "Start the UMBP tier server on the prefill node first (cookbook §3.9): UMBP_DRAM_CAPACITY=1500000000000 UMBP_DRAM_USE_HUGEPAGES=1 UMBP_SSD_ENABLED=0 umbp_standalone_server unix:///tmp/umbp/standalone.grpc.sock" },
+        { mode: "off",
+          when: { hw: ["gb300"], variant: ["pro-official"], quant: ["fp4"] },
+          enable: false,
+          env: [
+            "MOONCAKE_MASTER={{MOONCAKE_MASTER}}",
+            "MOONCAKE_TE_META_DATA_SERVER={{MOONCAKE_METADATA}}",
+            "MOONCAKE_LOCAL_HOSTNAME={{NODE_IP}}",
+            "MOONCAKE_PROTOCOL=rdma",
+            "MOONCAKE_DEVICE=mlx5_0,mlx5_1,mlx5_2,mlx5_3",
+            "MOONCAKE_GLOBAL_SEGMENT_SIZE=140gb",
+            "MOONCAKE_STANDALONE_STORAGE=0",
+            "MC_TCP_BIND_ADDRESS={{NODE_IP}}",
+          ],
+          flags: ["--hicache-storage-backend-extra-config '{\"enable_group_semantics\":true}'"],
+          note: "Start the Mooncake master and stores first (cookbook §3.10)." },
       ],
       defaultBackend: "mori",
       backends: [
-        { id: "mori",     label: "MORI (UMBP)" },
-        { id: "mooncake", label: "Mooncake" },
+        { id: "mori",     label: "MORI (UMBP)", hide: { hw: ["gb300"] } },
+        { id: "mooncake", label: "Mooncake", hide: { hw: ["mi300x", "mi355x"] } },
       ],
     },
 

@@ -450,7 +450,17 @@ export const Playground = ({ config }) => {
   // the default when the reader has not toggled the card; `allowTp` lifts
   // requiresDpAttention; env / flags join the recipe while it is on.
   const umbpRoleOverride = (fc, sel, h) => (fc.roleOverrides || []).find((r) =>
-    r && sel && r.mode === sel.pdMode && (!r.when || h.matchConstraint(sel, r.when)));
+    r && sel && r.mode === (sel.pdMode || "off")
+      && (!r.when || h.matchConstraint(sel, r.when)));
+
+  const umbpBackend = (value, fc, sel, h, derived) => {
+    const visible = (fc.backends || []).filter((b) => !h.evaluateChip(b, sel).hidden);
+    const requested = value.backend || (derived && derived.backend);
+    return (visible.find((b) => b.id === requested)
+      || visible.find((b) => b.defaultWhen && h.matchConstraint(sel, b.defaultWhen))
+      || visible.find((b) => b.id === fc.defaultBackend)
+      || visible[0] || { id: fc.defaultBackend || "mori" }).id;
+  };
 
   // -------- Prefill-CP flag family (shared by the attention axis) --------
   // Every flag head that toggles/parameterizes prefill context parallelism:
@@ -1548,8 +1558,7 @@ export const Playground = ({ config }) => {
           return { flags, env };
         }
         flags = h.stripFlagsByFirstToken(flags, HICACHE_HEADS);
-        const backend = value.backend
-          || (derived && derived.backend) || fc.defaultBackend || "mori";
+        const backend = umbpBackend(value, fc, sel, h, derived);
         flags = h.insertBeforeTail(flags, [
           "--enable-unified-cache-external-linker",
           `--unified-cache-external-linker-backend ${backend}`,
@@ -1574,8 +1583,7 @@ export const Playground = ({ config }) => {
           : (roleOverride ? !!roleOverride.enable : !!(derived && derived.enable));
         const needsDp = !!fc.requiresDpAttention && !base.dpAttnOn
           && !(roleOverride && roleOverride.allowTp);
-        const backend = value.backend !== null
-          ? value.backend : ((derived && derived.backend) || fc.defaultBackend || "mori");
+        const backend = umbpBackend(value, fc, base, h, derived);
         return (
           <div key={axisId} style={s.card}>
             <div style={s.compactRow}>
