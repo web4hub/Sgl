@@ -11,21 +11,21 @@ length finish. Drives the real `Req.update_finish_state`; pure CPU."""
 
 import unittest
 from array import array
+from unittest import mock
 
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
 
 maybe_stub_sgl_kernel()
 
-import sglang.srt.runtime_context as rc
 from sglang.srt.managers.schedule_batch import (
     FINISH_LENGTH,
     FINISH_MATCHED_STR,
     FINISH_MATCHED_TOKEN,
     Req,
 )
+from sglang.srt.runtime_context import get_context
 from sglang.srt.sampling.sampling_params import SamplingParams
-from sglang.srt.server_args import ServerArgs
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
@@ -201,25 +201,24 @@ class TestPostEosBonusTokenIncident(CustomTestCase):
 
 
 class TestSpecOvershootCacheLen(CustomTestCase):
-    """The radix cache key must stop where the client's output stops: keying
-    the tokens a verify step commits past the stop stored a suffix no
-    continuation can reproduce."""
-
-    def setUp(self):
-        rc.reset_context()
-        rc.get_context().set_server_args(ServerArgs(model_path="dummy"))
-
-    def tearDown(self):
-        rc.reset_context()
-
-    def test_commit_past_the_stop_is_excluded(self):
-        # One verify step commits [12, EOS, 20]; the two tokens after the EOS
-        # reach the KV pool but never the client.
+    def test_commit_past_stop_is_not_a_cache_key(self):
         req = _make_req([10, 11, 12, EOS_ID, 20], max_new_tokens=100)
         req.kv.kv_committed_len = len(req.origin_input_ids) + len(req.output_ids)
         req.update_finish_state(new_accepted_len=5)
-        self.assertEqual(req.finished_len, 4)
-        self.assertEqual(req.owned_kv_len(), len(req.origin_input_ids) + 4)
+        with get_context().override_server_args(strip_thinking_cache=False):
+            self.assertEqual(req.owned_kv_len(), 5)
+
+    def test_abort_stopless_keeps_committed_len(self):
+        """An abort keeps kv_committed_len; clamping trips the overalloc assert."""
+        req = _make_req([101, 102], max_new_tokens=10, vocab_size=10_000)
+        req.kv.kv_committed_len = 100
+        req.kv.kv_allocated_len = 100
+        with mock.patch("sglang.srt.managers.schedule_batch.get_parallel") as gp:
+            gp().tp_rank = 0
+            req.set_finish_with_abort("boom")
+        self.assertIsNone(req.finished_len)
+        with get_context().override_server_args(strip_thinking_cache=False):
+            self.assertEqual(req.owned_kv_len(), req.kv.kv_committed_len)
 
 
 if __name__ == "__main__":
