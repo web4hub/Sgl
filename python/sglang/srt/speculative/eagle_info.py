@@ -4,7 +4,10 @@ from typing import Callable, List, Optional
 
 import torch
 
-from sglang.kernels.ops.attention.utils import create_flashinfer_kv_indices_triton
+from sglang.kernels.ops.attention.utils import (
+    create_flashinfer_kv_indices_triton,
+    spec_kv_index_token_blocks,
+)
 from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode
 from sglang.srt.runtime_context import get_spec
 from sglang.srt.speculative.spec_info import SpecInput, SpecInputType
@@ -111,7 +114,12 @@ class EagleVerifyInput(SpecInput):
             dtype=torch.int32,
             device=device,
         )
-        create_flashinfer_kv_indices_triton[(batch_size,)](
+        num_token_blocks = spec_kv_index_token_blocks(
+            table_width=req_to_token.size(1),
+            kv_lens_sum=paged_kernel_lens_sum,
+            batch_size=batch_size,
+        )
+        create_flashinfer_kv_indices_triton[(batch_size, num_token_blocks)](
             req_to_token,
             req_pool_indices,
             paged_kernel_lens,
@@ -119,6 +127,7 @@ class EagleVerifyInput(SpecInput):
             None,
             kv_indices,
             req_to_token.size(1),
+            TOKEN_BLOCK_PARALLEL=num_token_blocks > 1,
         )
         mask_numel = (
             paged_kernel_lens_sum * self.draft_token_num
@@ -414,14 +423,20 @@ class EagleDraftExtendInput(SpecInput):
         cum_kv_seq_len = torch.zeros((bs + 1,), dtype=torch.int32, device=device)
         cum_kv_seq_len[1:] = torch.cumsum(paged_kernel_lens, dim=0)
 
+        # Sized while the length sum is still a host int (None -> table width).
+        num_token_blocks = spec_kv_index_token_blocks(
+            table_width=req_to_token.size(1),
+            kv_lens_sum=paged_kernel_lens_sum,
+            batch_size=bs,
+        )
+
         if paged_kernel_lens_sum is None:
             paged_kernel_lens_sum = cum_kv_seq_len[-1]
 
         kv_indices = torch.empty(
             paged_kernel_lens_sum, dtype=torch.int32, device=device
         )
-
-        create_flashinfer_kv_indices_triton[(bs,)](
+        create_flashinfer_kv_indices_triton[(bs, num_token_blocks)](
             req_to_token,
             req_pool_indices,
             paged_kernel_lens,
@@ -429,5 +444,6 @@ class EagleDraftExtendInput(SpecInput):
             None,
             kv_indices,
             req_to_token.size(1),
+            TOKEN_BLOCK_PARALLEL=num_token_blocks > 1,
         )
         return kv_indices, cum_kv_seq_len, qo_indptr, None

@@ -26,6 +26,7 @@ import torch
 from sglang.kernels.kernel_api_logging import debug_kernel_api
 from sglang.kernels.ops.attention.utils import (
     assert_buffer_fits,
+    spec_kv_index_token_blocks,
 )
 from sglang.srt.dllm.config import DllmConfig
 from sglang.srt.environ import envs
@@ -64,7 +65,6 @@ if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
 
 logger = logging.getLogger(__name__)
-
 
 if envs.SGLANG_ENABLE_TORCH_COMPILE.get():
     torch._logging.set_logs(dynamo=logging.ERROR)
@@ -2393,8 +2393,20 @@ class FlashInferMultiStepDraftBackend:
             seq_lens_sum=seq_lens_sum,
         )
 
+        # Blocks from the mean live length (capped by the draft window), not the table width.
+        num_token_blocks = spec_kv_index_token_blocks(
+            table_width=self.max_context_len,
+            kv_lens_sum=seq_lens_sum,
+            batch_size=num_seqs,
+            base_programs=self.speculative_num_steps * num_seqs * self.topk,
+            length_cap=(
+                self.draft_window_size + self.draft_sink_size
+                if self.draft_window_size > 0
+                else None
+            ),
+        )
         self.generate_draft_decode_kv_indices[
-            (self.speculative_num_steps, num_seqs, self.topk)
+            (self.speculative_num_steps * num_token_blocks, num_seqs, self.topk)
         ](
             forward_batch.req_pool_indices,
             self.req_to_token_pool.req_to_token,
@@ -2411,6 +2423,9 @@ class FlashInferMultiStepDraftBackend:
             self.page_size,
             self.draft_window_size,
             self.draft_sink_size,
+            # A single token block is the historical launch; NUM_STEPS=0 keeps
+            # its 128-wide program instead of the token-block specialization.
+            NUM_STEPS=self.speculative_num_steps if num_token_blocks > 1 else 0,
         )
 
         assert forward_batch.spec_info is not None
