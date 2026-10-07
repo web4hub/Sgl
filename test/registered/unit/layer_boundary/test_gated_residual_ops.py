@@ -1,9 +1,15 @@
 import unittest
+from types import SimpleNamespace
 from unittest.mock import patch
 
+import test_declared_decoder_boundary as fixture
 import torch
 
+from sglang.srt.layers.layer_boundary import layer_stack
 from sglang.srt.layers.layer_boundary.residual.gated import GatedResidualState
+from sglang.srt.layers.layer_boundary.residual.stream import ResidualStream
+from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.models.qwen4_exp import _build_qwen4_exp_stages
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -131,6 +137,70 @@ class TestGatedResidualOps(CustomTestCase):
         # Nothing survives the layer: the next layer's read produces its own.
         self.assertIsNone(state.normed)
 
+    def test_gate_partials_follow_their_read_and_are_cleared_after_write_back(self):
+        def mix(seed):
+            def read(residual):
+                hidden, pair = _mix(seed)(residual)
+                return hidden, (*pair, pair[1].mean(dim=-1, keepdim=True))
+
+            return read
+
+        def combine(hidden, residuals):
+            residual, normed, partials = residuals
+            return _combine(hidden * partials, (residual, normed))
+
+        state = GatedResidualState(_expand, mix(1), mix(2), combine, combine)
+        ops = state.residual_ops()
+        residual = _expand(self.hidden)
+        ops.attn_readout.read(residual, None)
+        _, attn_residuals = mix(1)(residual)
+        expected = combine(self.output, attn_residuals)
+        _, residual = ops.ffn_readout.update_and_read(
+            ops.attn_update, self.output, residual, None
+        )
+        torch.testing.assert_close(residual, expected)
+        _, ffn_residuals = mix(2)(expected)
+        result = ops.ffn_update.update(self.output, residual)
+        torch.testing.assert_close(result, combine(self.output, ffn_residuals))
+        self.assertIsNone(state.normed)
+        self.assertIsNone(state.gate_partials)
+
+    def test_reduced_ffn_output_still_writes_the_gated_residual_once(self):
+        for already_reduced in (False, True):
+            with self.subTest(already_reduced=already_reduced):
+                state = _state()
+                residual = _expand(self.hidden)
+                state.normed = _normalize(residual, 2)
+                expected = _combine(self.output * 4, (residual, state.normed))
+                batch = SimpleNamespace(
+                    residual_stream=ResidualStream(residual),
+                    forward_mode=ForwardMode.DECODE,
+                )
+                with (
+                    fixture.planning(fixture.parallel_of(attn_dp=1, attn_tp=4)),
+                    layer_stack(),
+                ):
+                    _, ffn = _build_qwen4_exp_stages(
+                        state.residual_ops(),
+                        sparse=True,
+                        layer_id=0,
+                        config=SimpleNamespace(num_hidden_layers=1, ple_layer_ids=[]),
+                    )
+                with patch(
+                    "sglang.srt.layers.layer_boundary.exit.sum_output",
+                    side_effect=lambda value, *args, **kwargs: value * 4,
+                ) as reduce:
+                    result = ffn.complete_now(
+                        self.output * (4 if already_reduced else 1),
+                        batch,
+                        already_reduced=already_reduced,
+                    )
+                self.assertEqual(reduce.call_count, int(not already_reduced))
+                torch.testing.assert_close(result, expected)
+                self.assertIs(batch.residual_stream.residual, result)
+                self.assertIsNone(batch.residual_stream.pending)
+                self.assertIsNone(state.normed)
+
     def test_the_ffn_input_is_read_from_the_updated_streams(self):
         state = _state()
         ops = state.residual_ops()
@@ -236,6 +306,8 @@ class TestGatedResidualOps(CustomTestCase):
         ops = state.residual_ops()
         residual = torch.arange(4 * WIDE, dtype=torch.float32).reshape(4, WIDE)
         state.normed = _normalize(residual, 1)
+        partials = torch.arange(4 * HC_COUNT).reshape(4, HC_COUNT)
+        state.gate_partials = partials
         with patch(
             "sglang.srt.layers.layer_boundary.residual.gated.get_parallel"
         ) as parallel:
@@ -245,6 +317,7 @@ class TestGatedResidualOps(CustomTestCase):
         torch.testing.assert_close(sliced, residual[2:])
         # The normalized rows must follow the stream rows they scale.
         torch.testing.assert_close(state.normed, _normalize(residual, 1)[2:])
+        torch.testing.assert_close(state.gate_partials, partials[2:])
 
     def test_attn_tp_gather_is_rejected(self):
         ops = _state().residual_ops()
