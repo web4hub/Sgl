@@ -71,6 +71,7 @@ from sglang.srt.mem_cache.allocator.unified_mamba import (
 )
 from sglang.srt.mem_cache.base_swa_memory_pool import BaseSWAKVPool
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
+from sglang.srt.mem_cache.unified_draft_pool import fused_draft_host_allocator
 from sglang.srt.runtime_context import get_parallel
 
 
@@ -112,13 +113,18 @@ class KVIndexTranslator:
         self.page_size = page_size
         self.device = device
 
-        self.is_translating = (
+        is_unified_target = (
             isinstance(
                 token_to_kv_pool_allocator,
                 (UnifiedMambaTokenToKVPoolAllocator, UnifiedSWAAllocatorBase),
             )
             and token_to_kv_pool_allocator.get_kvcache() is token_to_kv_pool
         )
+        host_allocator = fused_draft_host_allocator(token_to_kv_pool)
+        is_fused_draft = (
+            host_allocator is not None and host_allocator is token_to_kv_pool_allocator
+        )
+        self.is_translating = is_unified_target or is_fused_draft
         if self.is_translating:
             alloc = token_to_kv_pool_allocator
             self._capture_page_size = alloc.page_size
@@ -133,13 +139,17 @@ class KVIndexTranslator:
             # DCP read ids stay WIDENED to the consumer: selecting this rank's
             # share changes the length, so only the production site can do it.
             self.defer_read_translate = get_parallel().attn_dcp_size > 1
-            if isinstance(alloc, UnifiedSWAAllocatorBase):
+            routes_window_layers = is_unified_target or isinstance(
+                token_to_kv_pool, BaseSWAKVPool
+            )
+            if isinstance(alloc, UnifiedSWAAllocatorBase) and routes_window_layers:
                 self._swa_v2p_table = alloc.swa_v2p_page_table
                 self._swa_write_loc_from_full = self._swa_write_loc_unified
             else:
                 self._swa_v2p_table = None
                 self._swa_write_loc_from_full = None
         else:
+            self._capture_page_size = page_size
             self._full_v2p_table = None
             self._full_p2v_table = None
             self._translate_full = None
@@ -174,6 +184,14 @@ class KVIndexTranslator:
         if self.is_translating:
             return self._full_v2p_table.numel() * self._capture_page_size
         return max_token_pool_size + self.page_size
+
+    def full_flat_v2p(self) -> Optional[torch.Tensor]:
+        """The full-side v2p page table for a kernel that translates flat ids
+        itself, or ``None`` when this runner does not translate (pass-through
+        and static pools)."""
+        if not self.is_translating:
+            return None
+        return self._full_v2p_table
 
     # -- per-batch view --------------------------------------------------------
 
@@ -257,6 +275,7 @@ class KVIndexTranslator:
         seq_lens: torch.Tensor,
         max_pages: Optional[int] = None,
         into: Optional[KVReadTables] = None,
+        seq_len_delta: int = 0,
     ) -> KVIndexTable:
         """The one per-batch entry point.
 
@@ -265,6 +284,10 @@ class KVIndexTranslator:
         returns the table WHOLE, so a caller needing a stable pointer (a
         captured graph bakes it) passes its own tables in ``into``;
         ``into=None`` allocates of width ``max_pages`` instead.
+
+        ``seq_len_delta`` widens every row's live prefix -- the whole-sequence
+        verify contract (draft KV read back from the pool). An eager caller's
+        ``max_pages`` must already cover the delta.
         """
         if not self.is_translating or self.defer_read_translate:
             return KVIndexTable(
@@ -308,6 +331,7 @@ class KVIndexTranslator:
             page_size=self.page_size,
             max_pages=width,
             out=out_full,
+            seq_len_delta=seq_len_delta,
         )
         if out_swa is not None:
             build_kv_read_table(
@@ -318,6 +342,7 @@ class KVIndexTranslator:
                 page_size=self.page_size,
                 max_pages=width,
                 out=out_swa,
+                seq_len_delta=seq_len_delta,
             )
         return KVIndexTable(
             ids=out_full,
@@ -335,6 +360,7 @@ class KVIndexTranslator:
         req_pool_indices: torch.Tensor,
         seq_lens: torch.Tensor,
         sliding_window_out: Optional[torch.Tensor] = None,
+        seq_len_delta: int = 0,
     ) -> None:
         """`build_index_table(into=...)` for a caller that owns a bare block
         table rather than a KVReadTables: the page-table consumers read that
@@ -359,6 +385,7 @@ class KVIndexTranslator:
             req_pool_indices=req_pool_indices,
             seq_lens=seq_lens,
             into=KVReadTables(full=out, sliding_window=sliding_window_out),
+            seq_len_delta=seq_len_delta,
         )
 
     def index_table_for_batch(self, forward_batch) -> KVIndexTable:
@@ -403,6 +430,38 @@ class KVIndexTranslator:
         them.
         """
         return self._full_v2p_table
+
+    def widened_index_table(self, forward_batch, *, seq_len_delta: int) -> KVIndexTable:
+        """Whole-sequence-verify view: every row's live prefix widened by
+        `seq_len_delta` columns (the drafts are read back from the pool).
+        Not memoized -- verify is one consumer, and the batch's memoized
+        prefix table stays valid for the others.
+
+        The width comes from the LIVE prefix: a DSPARK/DFLASH verify batch
+        carries `seq_lens_cpu` already expanded by the window and keeps the
+        live lens on `spec_info.live_seq_lens_cpu`, so widening the expanded
+        lens would count the window twice. The width never exceeds the
+        `req_to_token` row it is read from."""
+        max_pages = None
+        if self.is_translating:
+            row_pages = -(-self.req_to_token.shape[1] // self.page_size)
+            live = getattr(forward_batch.spec_info, "live_seq_lens_cpu", None)
+            slc = live if live is not None else forward_batch.seq_lens_cpu
+            if (
+                forward_batch.seq_lens_sum is not None
+                and slc is not None
+                and slc.numel() > 0
+            ):
+                max_seq = int(slc.max()) + seq_len_delta
+                max_pages = min(max(-(-max_seq // self.page_size), 1), row_pages)
+            else:
+                max_pages = row_pages
+        return self.build_index_table(
+            req_pool_indices=forward_batch.req_pool_indices,
+            seq_lens=forward_batch.seq_lens,
+            max_pages=max_pages,
+            seq_len_delta=seq_len_delta,
+        )
 
     def bind_and_verify_backends(self, backends) -> None:
         """Boot: make every reachable backend carry THIS translator.
