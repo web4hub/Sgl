@@ -873,6 +873,32 @@ sgl-eval run aime25 \\
         "--port {{PORT}}",
       ],
     },
+    // Two-node GB300 NVFP4 aggregate, simplified from InferenceX #3659's
+    // TP8 c4 recipe at e79239ba (run 36997573694, attempt 2).
+    // The sweep used Dynamo; this standalone SGLang command is unverified.
+    {
+      match: { hw: "gb300", variant: "default", quant: "nvfp4", strategy: "low-latency", nodes: "multi-2" },
+      verified: false,
+      warn: "TP8 spans two four-GPU GB300 nodes. Set Head node IP and run node ranks 0 and 1. See [multi-node setup](#gb300-nvfp4-multi-node).",
+      env: [
+        "NCCL_CUMEM_ENABLE=1",
+        "NCCL_MNNVL_ENABLE=1",
+      ],
+      flags: [
+        "--model-path {{MODEL_NAME}}",
+        "--tp 8",
+        "--quantization modelopt_fp4",
+        "--fp4-gemm-backend flashinfer_trtllm",
+        "--speculative-algorithm EAGLE",
+        "--speculative-num-steps 5",
+        "--speculative-eagle-topk 1",
+        "--speculative-num-draft-tokens 6",
+        "--max-running-requests 8",
+        "--mem-fraction-static 0.8",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
     // ====================================================================
     // AMD MI300X / MI325X / MI355X (ROCm) — TP8, DSA tilelang backend.
     // No MTP: disabled in the Speculative card for AMD (the gfx950 spec-decode
