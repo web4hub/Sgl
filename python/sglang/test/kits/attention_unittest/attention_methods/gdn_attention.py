@@ -562,6 +562,8 @@ def _make_forward_batch(
             else None
         ),
     )
+    # Production batches take their KV ids from a plan (`init_new`).
+    runner.kv_index_translator.bind_own_plan(batch)
 
     if case.forward_mode.is_extend(include_draft_extend_v2=True):
         extend_seq_lens = torch.tensor(input_lens, dtype=torch.int32, device=device)

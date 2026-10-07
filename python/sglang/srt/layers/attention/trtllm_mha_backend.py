@@ -42,6 +42,7 @@ from sglang.srt.layers.quantization.fp4_kv_cache_quant_method import (
     KVCacheAttentionAccessKind,
 )
 from sglang.srt.layers.radix_attention import AttentionType
+from sglang.srt.mem_cache.kv_loc_plan import IdSpaceKind
 from sglang.srt.mem_cache.layout.paged_view import paged_kv_view
 from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool, KVWriteLoc
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
@@ -77,6 +78,9 @@ if TYPE_CHECKING:
 # Default workspace size in MB for TRTLLM MHA
 # Can be configured via SGLANG_FLASHINFER_WORKSPACE_SIZE environment variable
 DEFAULT_WORKSPACE_SIZE_MB = 512
+# flashinfer's XQA decode keeps its multi-block semaphores in the first 8 MiB
+# of the workspace and needs them zero at every launch.
+_XQA_SEMAPHORE_BYTES = 8 * 1024 * 1024
 
 # Reuse this workspace buffer across all TRTLLM MHA wrappers
 
@@ -157,11 +161,16 @@ class TRTLLMMHAMetadata:
     encoder_cache_seqlens: torch.Tensor = None
     encoder_page_table: torch.Tensor = None
     encoder_row_map: torch.Tensor = None
+    # fmha_v2 prefill: the [bs, max_pages] page-table entries this batch reads,
+    # and the block table over a copy that holds only those pages.
+    fmha_v2_page_mask: torch.Tensor = None
+    fmha_v2_block_table: torch.Tensor = None
 
 
 class TRTLLMHAAttnBackend(FlashInferAttnBackend):
     """TRTLLM MHA attention kernel from flashinfer."""
 
+    reads_kv_index_table = True  # the kernels read a page table
     # Build the page table on-device from seq_lens (incl. the SWA-translated table
     # via the full->SWA lookup; see _fill_page_table_device), so we never need the
     # seq_lens_cpu D2H sync; opt out of it, matching trtllm_mla / triton.
@@ -300,6 +309,9 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                 device=model_runner.device,
             ),
         )
+        # fmha_v2 prefill leaves tile counters at the base of its workspace, so
+        # it gets the part of the shared buffer past XQA's semaphores.
+        self.fmha_v2_workspace_buffer = self.workspace_buffer[_XQA_SEMAPHORE_BYTES:]
 
         # CUDA graph state
         self.decode_cuda_graph_metadata = {}
@@ -1088,16 +1100,18 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             # fused kernel skips its page-table writes so the graph reads the
             # refreshed content through pointers baked at capture).
             metadata = self.forward_metadata
-            # `cache_seqlens_int32` is what the attention kernels bound their
-            # page-table reads by, and the fused metadata call above wrote it.
-            # A target verify reads `draft_token_num` further than `seq_lens`
-            # goes, so filling to `seq_lens` leaves those columns untranslated.
-            self.kv_index_translator.fill_read_table(
-                out=metadata.page_table,
-                req_pool_indices=forward_batch.req_pool_indices[:bs],
-                seq_lens=metadata.cache_seqlens_int32,
-                sliding_window_out=metadata.swa_page_table,
+            # The kernels bound their page-table reads by `cache_seqlens_int32`
+            # (the fused metadata call above wrote it); the plan's table
+            # reaches that far, a target verify's draft tail included.
+            self.kv_index_translator.copy_page_table(
+                forward_batch.kv_loc_plan, out=metadata.page_table[:bs]
             )
+            if metadata.swa_page_table is not None:
+                self.kv_index_translator.copy_page_table(
+                    forward_batch.kv_loc_plan,
+                    out=metadata.swa_page_table[:bs],
+                    kind=IdSpaceKind.SLIDING_WINDOW,
+                )
             # A capture batch carries no prepared write loc; zeros are the
             # page-0 sink.
             if (
@@ -1110,8 +1124,8 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                     self.cuda_graph_swa_out_cache_loc[:n].zero_()
                 else:
                     self.cuda_graph_swa_out_cache_loc[:n].copy_(
-                        self.kv_index_translator.sliding_window_write_loc_for(
-                            forward_batch.out_cache_loc
+                        self.kv_index_translator.write_ids(
+                            forward_batch, IdSpaceKind.SLIDING_WINDOW
                         )
                     )
 
@@ -1153,7 +1167,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             metadata, req_pool_indices, metadata.cache_seqlens_int32
         )
         # The fused in-graph kernel also skips ragged batches, so refill the
-        # SWA write-target buffer here (out_cache_loc -> SWA locs).
+        # SWA write-target buffer here, from the plan.
         if self.use_sliding_window_kv_pool and forward_batch.out_cache_loc is not None:
             n = forward_batch.out_cache_loc.shape[0]
             self.cuda_graph_swa_out_cache_loc[n:].zero_()
@@ -1161,8 +1175,8 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                 self.cuda_graph_swa_out_cache_loc[:n].zero_()
             else:
                 self.cuda_graph_swa_out_cache_loc[:n].copy_(
-                    self.token_to_kv_pool.translate_loc_from_full_to_swa(
-                        forward_batch.out_cache_loc
+                    self.kv_index_translator.write_ids(
+                        forward_batch, IdSpaceKind.SLIDING_WINDOW
                     )
                 )
 
@@ -1265,13 +1279,21 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                 )
             else:
                 metadata.cu_seqlens_q = metadata.cu_seqlens_k
+            if self.use_fmha_v2 and not forward_batch.forward_mode.is_draft_extend_v2():
+                self._init_fmha_v2_batch_pages(metadata, forward_batch)
 
-        kv_view = self.kv_index_translator.index_table_for_batch(forward_batch)
-        if kv_view.is_translated:
-            # No fill kernel: the kernels take the tensor's own width/stride
-            # and bound their reads by cache_seqlens.
-            metadata.page_table = kv_view.ids
-            metadata.swa_page_table = kv_view.sliding_window_ids
+        if self.kv_index_translator.reads_are_translated:
+            # As wide as the captured and static tables: XQA sizes its multi-block
+            # split from the width, so a narrower table changes the output's rounding.
+            metadata.page_table = self._plan_table_at_captured_width(forward_batch)
+            metadata.swa_page_table = (
+                self._plan_table_at_captured_width(
+                    forward_batch, IdSpaceKind.SLIDING_WINDOW
+                )
+                if self.kv_index_translator.space(IdSpaceKind.SLIDING_WINDOW)
+                is not None
+                else None
+            )
         else:
             has_swa = self._swa_kv_pool is not None
             metadata.page_table = torch.empty(
@@ -1300,13 +1322,71 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
 
         # int64 scatter index (unlike the int32 read page table above).
         if self.use_sliding_window_kv_pool and forward_batch.out_cache_loc is not None:
-            metadata.swa_out_cache_loc = (
-                self.kv_index_translator.sliding_window_write_loc_for(
-                    forward_batch.out_cache_loc
-                )
+            metadata.swa_out_cache_loc = self.kv_index_translator.write_ids(
+                forward_batch, IdSpaceKind.SLIDING_WINDOW
             )
 
         self.forward_metadata = metadata
+
+    def _plan_table_at_captured_width(
+        self, forward_batch: ForwardBatch, kind: IdSpaceKind = IdSpaceKind.FULL
+    ) -> torch.Tensor:
+        table = torch.empty(
+            (forward_batch.batch_size, self.max_num_pages),
+            dtype=torch.int32,
+            device=forward_batch.seq_lens.device,
+        )
+        self.kv_index_translator.copy_page_table(
+            forward_batch.kv_loc_plan, out=table, kind=kind
+        )
+        return table
+
+    def _init_fmha_v2_batch_pages(
+        self, metadata: TRTLLMMHAMetadata, forward_batch: ForwardBatch
+    ) -> None:
+        """Index the pages this batch reads, for the fmha_v2 prefill copy.
+
+        Sized by the host max of seq_lens, which is live only alongside
+        seq_lens_sum (a GPU-only batch keeps a stale seq_lens_cpu); without it
+        the prefill copies the whole pool.
+        """
+        seq_lens_cpu = forward_batch.seq_lens_cpu
+        if (
+            forward_batch.seq_lens_sum is None
+            or seq_lens_cpu is None
+            or seq_lens_cpu.numel() == 0
+        ):
+            return
+        max_pages = -(-int(seq_lens_cpu.max()) // self.page_size)
+        num_pages = (
+            metadata.cache_seqlens_int32 + self.page_size - 1
+        ) // self.page_size
+        device = num_pages.device
+        metadata.fmha_v2_page_mask = (
+            torch.arange(max_pages, device=device) < num_pages[:, None]
+        )
+        metadata.fmha_v2_block_table = torch.arange(
+            num_pages.numel() * max_pages, dtype=torch.int32, device=device
+        ).view(-1, max_pages)
+
+    def _fmha_v2_paged_kv(
+        self, k_cache: torch.Tensor, v_cache: torch.Tensor, page_table: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """K and V as the [pages, 2, page_size, heads, head_dim] tensor fmha_v2
+        takes, and the block table that addresses it.
+
+        fmha_v2 derives strides from shapes, so this is a copy: of the batch's
+        pages only, unless that is no smaller than the whole pool.
+        """
+        mask = self.forward_metadata.fmha_v2_page_mask
+        if mask is None or mask.numel() >= k_cache.shape[0]:
+            return torch.stack([k_cache, v_cache], dim=1), page_table
+        # Past a row's last page the table may be unwritten; read page 0 there.
+        pages = torch.where(mask, page_table[:, : mask.shape[1]], 0).flatten()
+        paged_kv = torch.stack(
+            [k_cache.index_select(0, pages), v_cache.index_select(0, pages)], dim=1
+        )
+        return paged_kv, self.forward_metadata.fmha_v2_block_table
 
     def _reshape_paged_kv_cache(
         self,
@@ -1734,11 +1814,13 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         elif self.use_fmha_v2 and not cp_active:
             # CP must go through cp_strategy.run_attention (per-shard
             # masking); the plain-causal fmha_v2 call below would be wrong.
-            paged_kv = torch.stack([k_cache, v_cache], dim=1)
+            paged_kv, block_tables = self._fmha_v2_paged_kv(
+                k_cache, v_cache, page_table
+            )
             o = flashinfer.prefill.trtllm_fmha_v2_prefill(
                 (q, paged_kv),
                 input_layout="Q_PAGED_KV_NHD",
-                workspace_buffer=self.workspace_buffer,
+                workspace_buffer=self.fmha_v2_workspace_buffer,
                 seq_lens=self.forward_metadata.cache_seqlens_int32,
                 max_q_len=self.forward_metadata.max_seq_len_q,
                 max_kv_len=self.max_context_len,
@@ -1747,7 +1829,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                 batch_size=forward_batch.batch_size,
                 cum_seq_lens_q=self.forward_metadata.cu_seqlens_q,
                 cum_seq_lens_kv=self.forward_metadata.cu_seqlens_k,
-                block_tables=page_table,
+                block_tables=block_tables,
                 out_dtype=self.q_data_type,
                 mask_mode="causal",
                 window_left=layer.sliding_window_size,

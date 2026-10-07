@@ -486,12 +486,8 @@ class InklingAttention(nn.Module):
         do_store = do_bf16_store or do_mxfp8_store
         metadata = get_attn_backend().forward_metadata
         if do_store and self.is_local:
-            # SWA sub-pool + the backend's full->SWA translated write location.
+            # SWA sub-pool + the plan's sliding-window write ids (backend buffer).
             loc = metadata.swa_out_cache_loc
-        elif do_store:
-            loc = getattr(metadata, "out_cache_loc_full_physical", None)
-            if loc is None:
-                loc = forward_batch.out_cache_loc
         else:
             loc = forward_batch.out_cache_loc
         es = q.element_size()
@@ -589,10 +585,6 @@ class InklingAttention(nn.Module):
         metadata = get_attn_backend().forward_metadata
         if do_store and self.is_local:
             loc = metadata.swa_out_cache_loc
-        elif do_store:
-            loc = getattr(metadata, "out_cache_loc_full_physical", None)
-            if loc is None:
-                loc = forward_batch.out_cache_loc
         else:
             loc = forward_batch.out_cache_loc
         is_v2 = forward_batch.forward_mode.is_draft_extend_v2()
@@ -696,10 +688,6 @@ class InklingAttention(nn.Module):
         metadata = get_attn_backend().forward_metadata
         if do_store and self.is_local:
             loc = metadata.swa_out_cache_loc
-        elif do_store:
-            loc = getattr(metadata, "out_cache_loc_full_physical", None)
-            if loc is None:
-                loc = forward_batch.out_cache_loc
         else:
             loc = forward_batch.out_cache_loc
         es = q.element_size()
