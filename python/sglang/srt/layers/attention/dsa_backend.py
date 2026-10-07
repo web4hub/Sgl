@@ -84,6 +84,7 @@ from sglang.srt.layers.attention.trtllm_mla_backend import (
 )
 from sglang.srt.layers.cp.base import get_cp_strategy
 from sglang.srt.layers.cp.utils import is_cp_active
+from sglang.srt.layers.dcp.dsa import dcp_compact_read_table, dcp_prefill_page_table
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.utils import (
     is_cuda,
@@ -2114,6 +2115,15 @@ class DeepseekSparseAttnBackend(
 
         # Do absorbed multi-latent attention (MLA path)
         kv_cache = self.token_to_kv_pool.get_key_buffer(layer.layer_id)
+        prefill_page_table_1 = metadata.page_table_1
+        if (
+            get_parallel().dcp_enabled
+            and forward_batch.forward_mode.is_extend_without_speculative()
+        ):
+            # DCP: the local cache holds 1/W of the KV; read the all-gathered copy.
+            kv_cache, prefill_page_table_1 = self._dcp_prefill_kv_view(
+                forward_batch, metadata
+            )
 
         if q_rope is not None:
             q_nope = q.view(-1, layer.tp_q_head_num, layer.v_head_dim)
@@ -2156,7 +2166,7 @@ class DeepseekSparseAttnBackend(
             elif topk_transform_method == TopkTransformMethod.PAGED:
                 assert metadata.dsa_extend_seq_lens_list is not None
                 page_table_1 = transform_index_page_table_prefill(
-                    page_table=metadata.page_table_1,
+                    page_table=prefill_page_table_1,
                     topk_indices=topk_indices,
                     extend_lens_cpu=metadata.dsa_extend_seq_lens_list,
                     page_size=1,
@@ -2468,6 +2478,11 @@ class DeepseekSparseAttnBackend(
                 topk_indices=topk_indices,
                 page_size=1,
             )
+
+        if get_parallel().dcp_enabled and not forward_batch.forward_mode.is_idle():
+            if q_all is None:
+                q_all = torch.cat([q_nope, q_rope], dim=-1)
+            return self._forward_decode_dcp(q_all, kv_cache, page_table_1, layer)
 
         if dsa_impl == "flashmla_sparse":
             if q_rope is not None:
@@ -3191,6 +3206,54 @@ class DeepseekSparseAttnBackend(
             causal=causal,
         )
 
+    def _dcp_prefill_kv_view(self, forward_batch: ForwardBatch, metadata):
+        """All-gathered prefill KV and its [bs, max_len] position -> row table."""
+        dcp_meta = forward_batch.attn_dcp_metadata
+        assert dcp_meta is not None and dcp_meta.dcp_kv_buffer is not None
+        if dcp_meta.dsa_page_table_1 is None:
+            dcp_meta.dsa_page_table_1 = dcp_prefill_page_table(
+                dcp_meta.dcp_kv_indptr,
+                dcp_meta.dcp_kv_indices,
+                forward_batch.seq_lens_cpu,
+                metadata.page_table_1.shape[1],
+            )
+        return dcp_meta.dcp_kv_buffer, dcp_meta.dsa_page_table_1
+
+    def _forward_decode_dcp(
+        self,
+        q_all: torch.Tensor,
+        kv_cache: torch.Tensor,
+        page_table_1: torch.Tensor,
+        layer: RadixAttention,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Attend this rank's share of the global top-k -> (out, natural-log lse).
+
+        Owned slots are packed to the front so the split-K kernel only walks
+        about topk / W of them. A row this rank owns nothing of comes back with
+        zero output and a large negative LSE, so it drops out of the merge.
+        """
+        from sglang.kernels.ops.attention.dsa.triton_sparse_mla_decode import (
+            triton_sparse_mla_decode_splitk,
+        )
+
+        assert self.dsa_index_kpool <= 1, "DSA + DCP does not support index kpool"
+        q_all = q_all.view(-1, layer.tp_q_head_num, layer.head_dim)
+        local_table, local_lens = dcp_compact_read_table(page_table_1)
+        stream_id = int(torch.cuda.current_stream(q_all.device).cuda_stream)
+        workspace = self._triton_sparse_mla_workspaces.setdefault(stream_id, [])
+        out, lse = triton_sparse_mla_decode_splitk(
+            q_nope=q_all[:, :, : layer.v_head_dim],
+            q_rope=q_all[:, :, layer.v_head_dim :],
+            kv=kv_cache,
+            indices=local_table.unsqueeze(1),
+            sm_scale=layer.scaling,
+            d_v=layer.v_head_dim,
+            workspace=workspace,
+            return_lse=True,
+            lengths=local_lens,
+        )
+        return out.squeeze(0), lse
+
     def _forward_tilelang(
         self,
         q_all: torch.Tensor,
@@ -3768,6 +3831,7 @@ class DeepseekSparseAttnBackend(
                 <= forward_batch.get_max_chunk_capacity()  # Fits in chunk
                 and (not is_dsa_enable_prefill_cp())  # CP not enabled
                 and (self.hisparse_coordinator is None)
+                and (not get_parallel().dcp_enabled)  # MHA path reads the local shard
             )
         else:
             self.use_mha = False  # Decode/verify always use MLA
