@@ -1053,7 +1053,14 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
 
         # ScheduleBatch and req_to_token keep allocator-global slot identities.
         # Preserve that view before exposing rank-local NPU DCP write slots.
-        if _is_npu and get_parallel().dcp_enabled and not model_runner.is_draft_worker:
+        # Dense MLA (Kimi-K3) localizes token-interleaved slots in the KV
+        # writer. Only DSA needs page-interleaved slots localized here.
+        if (
+            _is_npu
+            and get_parallel().dcp_enabled
+            and not model_runner.is_draft_worker
+            and getattr(model_runner.model_config, "index_head_dim", None) is not None
+        ):
             ret.origin_out_cache_loc = ret.out_cache_loc
             if ret.out_cache_loc is not None:
                 ret.out_cache_loc = _localize_npu_dcp_out_cache_loc(
