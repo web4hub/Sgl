@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from collections import defaultdict
 from typing import TYPE_CHECKING, Callable, Optional, Sequence
 
@@ -56,6 +57,9 @@ if TYPE_CHECKING:
         UnifiedRadixCache,
         UnifiedTreeNode,
     )
+
+
+logger = logging.getLogger(__name__)
 
 
 class MambaComponent(TreeComponent):
@@ -588,10 +592,19 @@ class MambaComponent(TreeComponent):
             if cache_len is None:
                 cache_len = 0
             if self.cache.enable_mamba_extra_buffer:
-                checkpoint = self._select_finished_checkpoint(req, token_ids_len)
-                if checkpoint is None:
+                selected = self._select_finished_checkpoint(req, token_ids_len)
+                if selected is None:
+                    # An empty key stores nothing and frees the whole range --
+                    # the path a request that never crossed a boundary takes.
+                    logger.debug(
+                        "mamba checkpoint dropped: no slot names a state within "
+                        "the key (cache_len=%s, token_ids_len=%s, rid=%s)",
+                        req.kv.mamba_last_track_seqlen,
+                        token_ids_len,
+                        req.rid,
+                    )
                     return 0
-                cache_len, keep_idx = checkpoint
+                cache_len, keep_idx = selected
                 insert_params.mamba_keep_idx = keep_idx
                 active_value = (
                     req.kv.mamba_ping_pong_track_buffer[keep_idx].unsqueeze(-1).clone()

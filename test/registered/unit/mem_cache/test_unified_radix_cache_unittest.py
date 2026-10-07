@@ -9318,6 +9318,27 @@ class TestMambaFinishedOvershootCheckpoint(CustomTestCase):
                     self.assertIsNone(req.kv.mamba_pool_idx)
                 cache.sanity_check()
 
+    def test_strip_thinking_without_prompt_checkpoint(self):
+        """Discard output states when neither slot can name the prompt prefix."""
+        for previous_len in (None, 12):
+            with self.subTest(previous_len=previous_len):
+                cache, allocator, pool = build_fixture(
+                    self.cfg, mamba_cache_chunk_size=4
+                )
+                req, tokens = self._build_req(allocator, pool, previous_len)
+                req.origin_input_ids = array("q", tokens[:8])
+                req.output_ids = array("q", tokens[8:])
+                req.reasoning_tokens = 1
+                req.last_node = cache.root_node_handle()
+                with get_serving().override(strip_thinking_cache=True):
+                    finish_req(cache, req, req.owned_kv_len())
+                match = cache.match_prefix(
+                    MatchPrefixParams(key=RadixKey(array("q", tokens)))
+                )
+                self.assertEqual(len(match.device_indices), 0)
+                self.assertIsNone(req.kv.mamba_pool_idx)
+                cache.sanity_check()
+
 
 class TestUnifiedRadixCacheInt8MambaCheckpoint(CustomTestCase):
     cfg = CacheConfig(
