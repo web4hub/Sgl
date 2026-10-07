@@ -308,8 +308,8 @@ def test_customized_info_failure_is_request_local(release_kv_cache, poll, value)
         hidden_states_dtype=torch.float32,
         max_sampling_mask_tokens=1,
     )
-    release_kv_cache.side_effect = lambda req, cache: _free_req(
-        req, cache, is_insert=False
+    release_kv_cache.side_effect = lambda req, cache, checkpoint: _free_req(
+        req, cache, checkpoint=checkpoint
     )
     poll.return_value = [KVPoll.Failed]
 
@@ -342,7 +342,9 @@ def test_customized_info_failure_is_request_local(release_kv_cache, poll, value)
             assert scheduler.process_disagg_prefill_inflight_queue() == []
             assert req.finished_reason is finish_reason
             scheduler._release_aborted_request.assert_called_once_with(req)
-            release_kv_cache.assert_called_once_with(req, scheduler.tree_cache)
+            release_kv_cache.assert_called_once_with(
+                req, scheduler.tree_cache, checkpoint=False
+            )
             scheduler.req_to_metadata_buffer_idx_allocator.free.assert_called_once_with(
                 0
             )
