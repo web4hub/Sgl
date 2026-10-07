@@ -355,6 +355,26 @@ class TestHostMemoryBudget(CustomTestCase):
             self.assertEqual(base.ranks_per_host(), 8)
 
 
+class TestDSAIndexerCleanup(CustomTestCase):
+    def test_destroy_releases_index_registration_once(self):
+        # The registered index buffer is not kv_buffer, so the inherited
+        # cleanup alone would leave it registered.
+        pool = object.__new__(DSAIndexerPoolHost)
+        buffer = torch.empty((2, 8448), dtype=torch.uint8)
+        pool.index_k_with_scale_buffer = buffer
+        pool.pin_memory = True
+        cudart = unittest.mock.Mock()
+        cudart.cudaHostUnregister.return_value = 0
+        with (
+            unittest.mock.patch("sglang.srt.mem_cache.pool_host.dsa._is_cuda", True),
+            unittest.mock.patch("torch.cuda.cudart", return_value=cudart),
+        ):
+            pool.destroy()
+            pool.destroy()
+        cudart.cudaHostUnregister.assert_called_once_with(buffer.data_ptr())
+        self.assertIsNone(pool.index_k_with_scale_buffer)
+
+
 class TestHostPoolGroup(CustomTestCase):
     @staticmethod
     def _backup_under_host_pressure(
